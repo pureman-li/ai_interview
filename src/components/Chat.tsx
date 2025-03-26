@@ -63,10 +63,46 @@ const Chat: React.FC = () => {
   const [feedback, setFeedback] = useState<InterviewFeedback | null>(null);
   const [resumeFile, setResumeFile] = useState<File | null>(null);
   const [resumeContent, setResumeContent] = useState<string>('');
+  const [interviewStartTime, setInterviewStartTime] = useState<Date | null>(null);
+  const [elapsedTime, setElapsedTime] = useState<string>('00:00:00');
   const { isOpen, onOpen, onClose } = useDisclosure();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const toast = useToast();
+
+  // 计算面试进度
+  const calculateProgress = () => {
+    if (messages.length === 0) return 0;
+    // 计算 AI 提问的次数（每两个消息为一轮对话）
+    const aiQuestions = messages.filter(msg => msg.role === 'assistant').length;
+    // 假设面试总共有 8 个问题
+    return Math.min(Math.round((aiQuestions / 8) * 100), 100);
+  };
+
+  // 更新计时器
+  useEffect(() => {
+    if (interviewStartTime && !isInterviewEnded) {
+      timerRef.current = setInterval(() => {
+        const now = new Date();
+        const diff = now.getTime() - interviewStartTime.getTime();
+        const hours = Math.floor(diff / (1000 * 60 * 60));
+        const minutes = Math.floor((diff % (1000 * 60 * 60)) / (1000 * 60));
+        const seconds = Math.floor((diff % (1000 * 60)) / 1000);
+        setElapsedTime(
+          `${hours.toString().padStart(2, '0')}:${minutes
+            .toString()
+            .padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`
+        );
+      }, 1000);
+    }
+
+    return () => {
+      if (timerRef.current) {
+        clearInterval(timerRef.current);
+      }
+    };
+  }, [interviewStartTime, isInterviewEnded]);
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -228,8 +264,46 @@ ${resumeContent}
       return;
     }
 
+    // 清除计时器
+    if (timerRef.current) {
+      clearInterval(timerRef.current);
+    }
+
     setIsLoading(true);
     try {
+      const prompt = `你是一位专业的面试反馈生成器。请根据以下面试对话内容，生成一份详细的面试反馈报告。
+
+要求：
+1. 必须严格按照 JSON 格式输出
+2. 不要输出任何其他文字或解释
+3. 不要包含对话内容
+4. 确保 JSON 格式正确，可以被解析
+5. 对每个问题的回答进行详细评价
+6. 评价要客观、专业、严格
+7. 指出每个回答的优点和不足
+8. 给出具体的改进建议
+
+面试对话内容：
+${messages.map(msg => `${msg.role === 'assistant' ? '面试官' : '候选人'}：${msg.content}`).join('\n')}
+
+请严格按照以下 JSON 格式输出，不要添加任何其他内容：
+{
+  "score": 85,
+  "strengths": ["优势1", "优势2"],
+  "improvements": ["建议1", "建议2"],
+  "overallFeedback": "总结评价",
+  "questionFeedback": [
+    {
+      "question": "问题1",
+      "answer": "回答1",
+      "score": 80,
+      "strengths": ["优点1", "优点2"],
+      "weaknesses": ["不足1", "不足2"],
+      "suggestions": ["建议1", "建议2"]
+    }
+  ]
+}`;
+
       const response = await axios.post(
         import.meta.env.VITE_DEEPSEEK_API_URL,
         {
@@ -237,34 +311,8 @@ ${resumeContent}
           messages: [
             {
               role: 'system',
-              content: `你是一位经验丰富的${selectedPosition?.name}面试专家，请根据整个面试过程对候选人进行专业评价。
-
-请严格按照以下 JSON 格式输出评价，不要包含任何其他文字或解释：
-
-{
-  "score": 85,
-  "strengths": ["优势1", "优势2", "优势3"],
-  "improvements": ["建议1", "建议2", "建议3"],
-  "overallFeedback": "总体评价内容"
-}
-
-评价要求：
-1. score: 0-100 的整数，基于候选人的整体表现
-2. strengths: 数组，列出候选人的主要优势，每个优势要具体且有实例支撑
-3. improvements: 数组，列出需要改进的地方，建议要具体且可执行
-4. overallFeedback: 字符串，对候选人进行全面的总结，评价要客观、专业、有建设性
-
-注意：
-- 必须严格按照上述 JSON 格式输出
-- 不要添加任何其他文字或解释
-- 确保 JSON 格式正确，可以被解析
-- 所有字段都必须存在且格式正确
-- 如果面试内容不足，无法生成有效评价，请返回 null`
+              content: prompt,
             },
-            ...messages.map((msg) => ({
-              role: msg.role,
-              content: msg.content,
-            }))
           ],
           temperature: 0.7,
           max_tokens: 2000,
@@ -277,86 +325,52 @@ ${resumeContent}
         }
       );
 
-      const feedbackContent = response.data.choices[0].message.content;
-      console.log('Raw feedback content:', feedbackContent);
+      if (!response.data || !response.data.choices || !response.data.choices[0]) {
+        throw new Error('Invalid API response');
+      }
 
+      const feedbackText = response.data.choices[0].message.content;
+      console.log('Feedback Response:', feedbackText); // 添加日志
+      
+      // 尝试清理和解析 JSON
+      let cleanedContent = feedbackText
+        .replace(/```json\n?|\n?```/g, '') // 移除 markdown 代码块
+        .replace(/^\s*\[|\]\s*$/g, '') // 移除可能的数组包装
+        .trim();
+
+      // 尝试提取 JSON 对象
+      const jsonMatch = cleanedContent.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        cleanedContent = jsonMatch[0];
+      }
+
+      // 尝试修复常见的 JSON 格式问题
+      cleanedContent = cleanedContent
+        .replace(/([{,]\s*)(\w+)(\s*:)/g, '$1"$2"$3') // 给属性名添加引号
+        .replace(/'/g, '"') // 将单引号替换为双引号
+        .replace(/,\s*([}\]])/g, '$1'); // 移除尾随逗号
+
+      console.log('Cleaned content:', cleanedContent);
+      
+      // 尝试解析 JSON
       try {
-        // 尝试清理和解析 JSON
-        let cleanedContent = feedbackContent
-          .replace(/```json\n?|\n?```/g, '') // 移除 markdown 代码块
-          .replace(/^\s*\[|\]\s*$/g, '') // 移除可能的数组包装
-          .trim();
-
-        // 尝试提取 JSON 对象
-        const jsonMatch = cleanedContent.match(/\{[\s\S]*\}/);
-        if (jsonMatch) {
-          cleanedContent = jsonMatch[0];
-        }
-
-        console.log('Cleaned content:', cleanedContent);
-
-        // 尝试修复常见的 JSON 格式问题
-        cleanedContent = cleanedContent
-          .replace(/([{,]\s*)(\w+)(\s*:)/g, '$1"$2"$3') // 给属性名添加引号
-          .replace(/'/g, '"') // 将单引号替换为双引号
-          .replace(/,\s*([}\]])/g, '$1'); // 移除尾随逗号
-
-        console.log('Fixed content:', cleanedContent);
-
-        // 检查是否为 null
-        if (cleanedContent.toLowerCase() === 'null') {
-          throw new Error('面试内容不足，无法生成有效评价');
-        }
-
-        const parsedFeedback = JSON.parse(cleanedContent);
-        
-        // 验证反馈数据的完整性
-        if (!parsedFeedback.score || !parsedFeedback.strengths || !parsedFeedback.improvements || !parsedFeedback.overallFeedback) {
-          console.error('Invalid feedback structure:', parsedFeedback);
-          throw new Error('反馈数据不完整');
-        }
-
-        // 验证数据类型
-        if (typeof parsedFeedback.score !== 'number' ||
-            !Array.isArray(parsedFeedback.strengths) ||
-            !Array.isArray(parsedFeedback.improvements) ||
-            typeof parsedFeedback.overallFeedback !== 'string') {
-          console.error('Invalid data types:', parsedFeedback);
-          throw new Error('反馈数据格式不正确');
-        }
-        
-        setFeedback(parsedFeedback);
+        const feedback = JSON.parse(cleanedContent);
+        setFeedback(feedback);
         setShowFeedback(true);
         setIsInterviewEnded(true);
-        toast({
-          title: '面试结束',
-          description: '本次面试已结束，请前往面试反馈查询面试结果',
-          status: 'info',
-          duration: 5000,
-          isClosable: true,
-        });
       } catch (error) {
-        console.error('Failed to parse feedback:', error);
-        console.error('Original content:', feedbackContent);
-        toast({
-          title: '反馈生成失败',
-          description: error instanceof Error ? error.message : '无法生成有效的面试反馈，请稍后重试',
-          status: 'error',
-          duration: 5000,
-          isClosable: true,
-        });
-        return;
+        console.error('Error parsing feedback:', error);
+        throw new Error('Invalid feedback format');
       }
     } catch (error) {
-      console.error('API call failed:', error);
+      console.error('Error generating feedback:', error);
       toast({
-        title: '反馈生成失败',
-        description: '服务器连接失败，请检查网络后重试',
+        title: '生成反馈失败',
+        description: '无法生成面试反馈，请稍后重试',
         status: 'error',
         duration: 5000,
         isClosable: true,
       });
-      return;
     } finally {
       setIsLoading(false);
     }
@@ -364,18 +378,55 @@ ${resumeContent}
 
   const handleRestartInterview = () => {
     setMessages([]);
+    setInput('');
     setShowFeedback(false);
-    setIsInterviewEnded(false);
-    setSelectedPosition(null);
     setFeedback(null);
+    setIsInterviewEnded(false);
+    setInterviewStartTime(new Date());
+    setElapsedTime('00:00:00');
   };
 
   const handlePositionSelect = async (position: Position | null) => {
     if (position) {
       setSelectedPosition(position);
       setMessages([]); // 清空之前的对话
+      setInterviewStartTime(new Date()); // 设置面试开始时间
       setIsLoading(true);
       try {
+        const prompt = `你现在是一位专业的${position.name}面试官。请严格按照以下要求进行面试：
+
+1. 面试风格：
+   - 保持专业、友好的态度
+   - 每次只提出一个问题，等待候选人回答后再继续
+   - 根据候选人的回答进行追问或提出下一个问题
+   - 问题难度要循序渐进，从基础到深入
+
+2. 面试流程：
+   - 首先进行简短的自我介绍
+   - 然后开始提问，每次只问一个问题
+   - 根据候选人的回答进行追问或提出下一个问题
+   - 面试结束时给出总结性评价
+
+3. 注意事项：
+   - 不要一次性提出多个问题
+   - 不要提前给出答案
+   - 不要自问自答
+   - 不要在没有候选人回答的情况下进行追问
+   - 保持对话的自然流畅
+   - 关注候选人的实际能力和经验
+
+${resumeContent ? `候选人简历内容：
+${resumeContent}
+
+请根据候选人的简历内容，生成更有针对性的面试问题。` : ''}
+
+请严格按照以下格式输出：
+1. 首先进行简短的自我介绍（不超过 2 句话）
+2. 然后提出第一个问题（只问一个问题，不要自问自答，不要追问）
+3. 等待候选人回答后再继续
+
+注意：这是面试的开始，只需要自我介绍和提出一个问题，不要进行追问或自问自答。`;
+
         const response = await axios.post(
           import.meta.env.VITE_DEEPSEEK_API_URL,
           {
@@ -383,45 +434,8 @@ ${resumeContent}
             messages: [
               {
                 role: 'system',
-                content: `你是一位经验丰富的${position.name}面试专家。你的特点是：
-1. 专业性强：对${position.name}领域有深入理解
-2. 经验丰富：有丰富的面试经验
-3. 态度友好：以友善、专业的态度进行面试
-4. 注重细节：善于观察候选人的回答细节
-5. 善于引导：能够通过追问深入了解候选人
-6. 客观公正：基于事实和标准进行评估
-
-面试重点：
-1. 技术能力：${position.requirements.join('、')}
-2. 专业素质：学习能力、团队协作、沟通能力等
-3. 项目经验：实际项目经历和解决问题的能力
-
-${resumeContent ? `候选人简历内容：
-${resumeContent}
-
-请根据候选人的简历内容，生成更有针对性的面试问题。` : ''}
-
-请用中文进行面试，并遵循以下规则：
-1. 每次只问一个问题
-2. 问题要简洁明了
-3. 根据候选人的回答调整问题难度
-4. 使用 Markdown 格式输出
-5. 在问题前标注"面试官："，在回答前标注"候选人："
-6. 如果候选人的回答不够完整，可以追问一次，但追问后必须进入下一个问题
-7. 追问规则：
-   - 只针对关键点或模糊处进行追问
-   - 追问要简洁明确
-   - 追问后无论回答如何，都进入下一个问题
-8. 面试结束时，给出详细的评估报告
-
-现在，请先进行自我介绍，然后提出第一个问题。注意：
-1. 自我介绍要简洁专业，说明你是 AI 面试官
-2. 只提出一个问题，不要生成答案
-3. 问题要针对${position.name}岗位的核心要求
-4. 使用 Markdown 格式，让问题清晰易读
-5. 严格禁止在提问后自问自答或提供答案示例
-6. 提问后直接等待候选人回答`
-              }
+                content: prompt,
+              },
             ],
             temperature: 0.7,
             max_tokens: 2000,
@@ -434,7 +448,12 @@ ${resumeContent}
           }
         );
 
+        if (!response.data || !response.data.choices || !response.data.choices[0]) {
+          throw new Error('Invalid API response');
+        }
+
         const aiMessage = response.data.choices[0].message.content;
+        console.log('AI Response:', aiMessage); // 添加日志
         setMessages([{ role: 'assistant', content: aiMessage }]);
       } catch (error) {
         console.error('Error:', error);
@@ -451,6 +470,8 @@ ${resumeContent}
     } else {
       setSelectedPosition(null);
       setResumeContent('');
+      setInterviewStartTime(null);
+      setElapsedTime('00:00:00');
     }
   };
 
@@ -496,6 +517,7 @@ ${resumeContent}
           isClosable: true,
         });
       } catch (error) {
+        console.error('Error reading file:', error);
         toast({
           title: '简历分析失败',
           description: '无法读取文件内容，请确保文件格式正确',
@@ -585,6 +607,28 @@ ${resumeContent}
                     </Button>
                   </HStack>
                 </Flex>
+
+                {/* 面试进度和计时器 */}
+                <Box p={4} bg="gray.50" borderRadius="lg">
+                  <VStack spacing={2} align="stretch">
+                    <Flex justify="space-between" align="center">
+                      <Text fontWeight="medium">面试进度</Text>
+                      <Text fontWeight="medium">用时：{elapsedTime}</Text>
+                    </Flex>
+                    <Box w="100%" h="4px" bg="gray.200" borderRadius="full">
+                      <Box
+                        w={`${calculateProgress()}%`}
+                        h="100%"
+                        bg="blue.500"
+                        borderRadius="full"
+                        transition="width 0.3s ease"
+                      />
+                    </Box>
+                    <Text fontSize="sm" color="gray.600">
+                      已完成 {calculateProgress()}%
+                    </Text>
+                  </VStack>
+                </Box>
 
                 {/* 简历上传模态框 */}
                 <Modal isOpen={isOpen} onClose={onClose}>
